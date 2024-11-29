@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::result::Result;
 
-pub struct FileLayerFuse {
+pub struct FilesFuse {
     url: Url
 }
 
-impl FileLayerFuse {
-    pub fn new(url: Url) -> FileLayerFuse {
+impl FilesFuse {
+    pub fn new(url: Url) -> FilesFuse {
         Self { url }
     }
 
     fn lookup(&self, parent: u64, name: &str) -> Result<u64> {
-        let path = format!("file-layer/lookup/{parent}/{name}");
+        let path = format!("files/lookup/{parent}/{name}");
         let url = self.url.join(&path)?;
         let text = Client::new().get(url).send()?.text()?;
         let node = text.parse::<u64>()?;
@@ -25,7 +25,7 @@ impl FileLayerFuse {
     }
 
     fn info(&self, node: u64) -> Result<ContentInformation> {
-        let path = format!("file-layer/info/{node}");
+        let path = format!("files/info/{node}");
         let url = self.url.join(&path)?;
         let text = Client::new().get(url).send()?.text()?;
         let content_info = serde_json::from_str::<ContentInformation>(&text)?;
@@ -37,7 +37,7 @@ impl FileLayerFuse {
     }
 
     fn setattr(&self, node: u64, attr: &EntryAttriutes) -> Result<()> {
-        let path = format!("file-layer/attributes/{node}");
+        let path = format!("files/attributes/{node}");
         let url = self.url.join(&path)?;
         let attr_text = serde_json::to_string(attr)?;
         Client::new().put(url).body(attr_text).send()?;
@@ -61,7 +61,7 @@ impl FileLayerFuse {
     }
 
     fn make_node(&self, parent: u64, name: &str, kind: ContentKind) -> Result<u64> {
-        let path = format!("file-layer/{parent}/{name}");
+        let path = format!("files/{parent}/{name}");
         let mut url = self.url.join(&path)?;
         if kind == ContentKind::Directory {
             url.set_query(Some("kind=Directory"))
@@ -76,14 +76,14 @@ impl FileLayerFuse {
     }
 
     fn remove_node(&self, parent: u64, name: &str) -> Result<bool> {
-        let path = format!("file-layer/{parent}/{name}");
+        let path = format!("files/{parent}/{name}");
         let url = self.url.join(&path)?;
         let text = Client::new().post(url).send()?.text()?;
         Ok(text.parse()?)
     }
 
     fn rename_node(&self, parent: u64, name: &str, new_parent: u64, new_name: &str) -> Result<bool> {
-        let path = format!("file-layer/rename/{parent}/{name}");
+        let path = format!("files/rename/{parent}/{name}");
         let mut url = self.url.join(&path)?;
         let new_parent = format!("newParent={new_parent}");
         let new_name = format!("newName={new_name}");
@@ -94,7 +94,7 @@ impl FileLayerFuse {
     }
 
     fn link_node(&self, parent: u64, node: u64, name: &str) -> Result<bool> {
-        let path = format!("file-layer/link/{parent}/{name}");
+        let path = format!("files/link/{parent}/{name}");
         let mut url = self.url.join(&path)?;
         let node = format!("node={node}");
         url.set_query(Some(&node));
@@ -112,7 +112,7 @@ impl FileLayerFuse {
     }
 
     fn read_node(&self, node: u64, offset: u64, length: u64) -> Result<Bytes> {
-        let path = format!("file-layer/{node}");
+        let path = format!("files/{node}");
         let mut url = self.url.join(&path)?;
         let offset_option = format!("offset={offset}");
         let length_option = format!("length={length}");
@@ -123,7 +123,7 @@ impl FileLayerFuse {
     }
 
     fn write_node(&self, node: u64, offset: u64, data: &[u8]) -> Result<u64> {
-        let path = format!("file-layer/{node}");
+        let path = format!("files/{node}");
         let mut url = self.url.join(&path)?;
         let offset_option = format!("offset={offset}");
         url.set_query(Some(&offset_option));
@@ -136,7 +136,7 @@ impl FileLayerFuse {
     }
 
     fn read_directory(&self, node: u64, offset: u64) -> Result<Vec<FileDirectoryEntry>> {
-        let path = format!("file-layer/directory/{node}");
+        let path = format!("files/directory/{node}");
         let mut url = self.url.join(&path)?;
         if offset > 0 {
             let offset_option = format!("offset={offset}");
@@ -147,13 +147,13 @@ impl FileLayerFuse {
     }
 
     fn sync(&self) -> Result<()> {
-        let url = self.url.join("/file-layer/sync")?;
+        let url = self.url.join("/files/sync")?;
         Client::new().put(url).send()?;
         Ok(())
     }
 }
 
-impl Filesystem for FileLayerFuse {
+impl Filesystem for FilesFuse {
     fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> std::result::Result<(), c_int> {
         Ok(())
     }

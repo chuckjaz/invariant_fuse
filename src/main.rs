@@ -1,11 +1,11 @@
 use std::{ffi::OsString, path::Path};
 
 use clap::Parser;
-use file_layer_fuse::FileLayerFuse;
+use files_fuse::FilesFuse as FilesFuse;
 use reqwest::Url;
 use result::Result;
 use env_logger::Env;
-mod file_layer_fuse;
+mod files_fuse;
 mod result;
 
 #[derive(Debug, Parser)]
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
 }
 
 fn start_fuse(url: Url, path: &Path) -> Result<()>{
-    let filesystem = FileLayerFuse::new(url);
+    let filesystem = FilesFuse::new(url);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
