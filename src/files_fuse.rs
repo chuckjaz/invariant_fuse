@@ -36,7 +36,7 @@ impl FilesFuse {
         Ok(self.info(self.lookup(parent, name)?)?)
     }
 
-    fn setattr(&self, node: u64, attr: &EntryAttriutes) -> Result<()> {
+    fn setattr(&self, node: u64, attr: &EntryAttributes) -> Result<()> {
         let path = format!("files/attributes/{node}");
         let url = self.url.join(&path)?;
         let attr_text = serde_json::to_string(attr)?;
@@ -44,7 +44,7 @@ impl FilesFuse {
         Ok(())
     }
 
-    fn setattr_info(&self, node: u64, attr: &EntryAttriutes) -> Result<ContentInformation> {
+    fn setattr_info(&self, node: u64, attr: &EntryAttributes) -> Result<ContentInformation> {
         self.setattr(node, attr)?;
         self.info(node)
     }
@@ -56,7 +56,7 @@ impl FilesFuse {
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<std::time::SystemTime>
     ) -> Result<ContentInformation> {
-        let attr = EntryAttriutes::new(mode, mtime, ctime)?;
+        let attr = EntryAttributes::new(mode, mtime, ctime)?;
         self.setattr_info(node, &attr)
     }
 
@@ -772,7 +772,7 @@ impl ContentInformation {
 }
 
 #[derive(Serialize, Deserialize)]
-struct EntryAttriutes {
+struct EntryAttributes {
     executable: Option<bool>,
     writable: Option<bool>,
 
@@ -786,7 +786,7 @@ struct EntryAttriutes {
     content_type: Option<String>,
 }
 
-impl EntryAttriutes {
+impl EntryAttributes {
     fn new(
         mode: Option<u32>,
         mtime: Option<fuser::TimeOrNow>,

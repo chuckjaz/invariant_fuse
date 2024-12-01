@@ -15,7 +15,7 @@ mod result;
 #[command(about = "A FUSE to mount an invariant file system locally")]
 pub struct FuseCommand {
     /// The URL of the file system host. It is highly recommended that this be a local service
-    /// inaccessable outside the local machine.
+    /// inaccessible outside the local machine.
     url: Url,
 
     /// The location to mount the directory
