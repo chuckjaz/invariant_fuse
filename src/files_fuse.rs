@@ -16,6 +16,13 @@ impl FilesFuse {
         Self { url }
     }
 
+    pub fn ping(&self) -> Result<String> {
+        let path = "/id/";
+        let url = self.url.join(&path)?;
+        let text = Client::new().get(url).send()?.text()?;
+        Ok(text)
+    }
+
     fn lookup(&self, parent: u64, name: &str) -> Result<u64> {
         let path = format!("files/lookup/{parent}/{name}");
         let url = self.url.join(&path)?;
@@ -750,7 +757,8 @@ impl ContentInformation {
         let kind = if self.kind == ContentKind::File { FileType::RegularFile } else { FileType::Directory };
         let w = if self.writable { 0o200u16 } else { 0o000u16 };
         let x  = if self.executable { 0o100u16 } else { 0o000u16 };
-        let perm = 0o455 | x | w;
+        let base = if kind == FileType::RegularFile { 0o444 } else { 0o455 };
+        let perm = base | x | w;
         FileAttr {
             ino: self.node,
             size: self.size.unwrap_or(0),

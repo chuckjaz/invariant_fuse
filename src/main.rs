@@ -35,7 +35,16 @@ fn main() -> Result<()> {
 }
 
 fn start_fuse(url: Url, path: &Path) -> Result<()>{
-    let filesystem = FilesFuse::new(url);
-    fuser::mount2(filesystem, path, &[])?;
-    Ok(())
+    let filesystem = FilesFuse::new(url.clone());
+    let id = filesystem.ping();
+    match id {
+        Err(e) => {
+            println!("Could not connect to server at {url}, {e}");
+            Err(e)
+        },
+        Ok(_) =>  {
+            fuser::mount2(filesystem, path, &[])?;
+            Ok(())
+        }
+    }
 }
