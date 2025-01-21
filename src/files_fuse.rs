@@ -7,20 +7,25 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::result::Result;
 
+/// A file system implementation that uses the Files Server API
 pub struct FilesFuse {
-    url: Url
+    /// The url of the files server
+    url: Url,
+
+    /// The node mounted as root. This must be 1 for Filesystem APIs so it must be mapped to 1 for
+    /// Filesystem APIs
+    root: u64
 }
 
 impl FilesFuse {
-    pub fn new(url: Url) -> FilesFuse {
-        Self { url }
-    }
-
-    pub fn ping(&self) -> Result<String> {
-        let path = "/id/";
-        let url = self.url.join(&path)?;
-        let text = Client::new().get(url).send()?.text()?;
-        Ok(text)
+    pub fn mount(url: Url, content_link: String) -> Result<FilesFuse> {
+        let path = format!("files/mount");
+        let mount_url = url.clone().join(&path)?;
+        let body = Body::from(content_link);
+        let text = Client::new().post(mount_url.clone()).body(body).send()?.text()?;
+        debug!("mount response: {text}");
+        let root = text.parse::<u64>()?;
+        Ok(Self { url, root })
     }
 
     fn lookup(&self, parent: u64, name: &str) -> Result<u64> {
@@ -28,31 +33,43 @@ impl FilesFuse {
         let url = self.url.join(&path)?;
         let text = Client::new().get(url).send()?.text()?;
         let node = text.parse::<u64>()?;
-        Ok(node)
+
+        Ok(self.node_out(node))
     }
 
     fn info(&self, node: u64) -> Result<ContentInformation> {
-        let path = format!("files/info/{node}");
+        let in_node = self.node_in(node);
+        let path = format!("files/info/{in_node}");
         let url = self.url.join(&path)?;
+        debug!("FileFuse::info url={url}");
         let text = Client::new().get(url).send()?.text()?;
         let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+
         Ok(content_info)
     }
 
     fn lookup_info(&self, parent: u64, name: &str) -> Result<ContentInformation> {
-        Ok(self.info(self.lookup(parent, name)?)?)
+        let in_parent = self.node_in(parent);
+        let node = self.lookup(in_parent, name)?;
+        let info = self.info(node)?;
+
+        Ok(info)
     }
 
     fn setattr(&self, node: u64, attr: &EntryAttributes) -> Result<()> {
-        let path = format!("files/attributes/{node}");
+        let in_node = self.node_in(node);
+        let path = format!("files/attributes/{in_node}");
         let url = self.url.join(&path)?;
         let attr_text = serde_json::to_string(attr)?;
         Client::new().put(url).body(attr_text).send()?;
+
         Ok(())
     }
 
     fn setattr_info(&self, node: u64, attr: &EntryAttributes) -> Result<ContentInformation> {
-        self.setattr(node, attr)?;
+        let in_node = self.node_in(node);
+        self.setattr(in_node, attr)?;
+
         self.info(node)
     }
 
@@ -63,54 +80,72 @@ impl FilesFuse {
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<std::time::SystemTime>
     ) -> Result<ContentInformation> {
+        let in_node = self.node_in(node);
         let attr = EntryAttributes::new(mode, mtime, ctime)?;
-        self.setattr_info(node, &attr)
+        self.setattr_info(in_node, &attr)
     }
 
     fn make_node(&self, parent: u64, name: &str, kind: ContentKind) -> Result<u64> {
-        let path = format!("files/{parent}/{name}");
+        let in_parent = self.node_in(parent);
+        let path = format!("files/{in_parent}/{name}");
         let mut url = self.url.join(&path)?;
         if kind == ContentKind::Directory {
             url.set_query(Some("kind=Directory"))
         }
         let node_text = Client::new().put(url).send()?.text()?;
-        Ok(node_text.parse()?)
+        let node = node_text.parse::<u64>()?;
+        let node_out = self.node_out(node);
+
+        Ok(node_out)
     }
 
     fn make_node_info(&self, parent: u64, name: &str, kind: ContentKind) -> Result<ContentInformation> {
-        let node = self.make_node(parent, name, kind)?;
-        self.info(node)
+        let in_parent = self.node_in(parent);
+        let node = self.make_node(in_parent, name, kind)?;
+        let node_out = self.node_out(node);
+
+        self.info(node_out)
     }
 
     fn remove_node(&self, parent: u64, name: &str) -> Result<bool> {
-        let path = format!("files/{parent}/{name}");
+        let in_parent = self.node_in(parent);
+        let path = format!("files/{in_parent}/{name}");
         let url = self.url.join(&path)?;
         let text = Client::new().post(url).send()?.text()?;
+
         Ok(text.parse()?)
     }
 
     fn rename_node(&self, parent: u64, name: &str, new_parent: u64, new_name: &str) -> Result<bool> {
-        let path = format!("files/rename/{parent}/{name}");
+        let in_parent = self.node_in(parent);
+        let in_new_parent = self.node_in(new_parent);
+        let path = format!("files/rename/{in_parent}/{name}");
         let mut url = self.url.join(&path)?;
-        let new_parent = format!("newParent={new_parent}");
+        let new_parent = format!("newParent={in_new_parent}");
         let new_name = format!("newName={new_name}");
         url.set_query(Some(&new_parent));
         url.set_query(Some(&new_name));
         let response = Client::new().post(url).send()?;
+
         Ok(response.status() == 200)
     }
 
     fn link_node(&self, parent: u64, node: u64, name: &str) -> Result<bool> {
-        let path = format!("files/link/{parent}/{name}");
+        let in_parent = self.node_in(parent);
+        let in_node = self.node_in(node);
+        let path = format!("files/link/{in_parent}/{name}");
         let mut url = self.url.join(&path)?;
-        let node = format!("node={node}");
+        let node = format!("node={in_node}");
         url.set_query(Some(&node));
         let response = Client::new().post(url).send()?;
+
         Ok(response.status() == 200)
     }
 
     fn link_info(&self, parent: u64, node: u64, name: &str) -> Result<Option<ContentInformation>> {
-        let result = self.link_node(parent, node, name)?;
+        let in_parent = self.node_in(parent);
+        let in_node = self.node_in(node);
+        let result = self.link_node(in_parent, in_node, name)?;
         if result {
             Ok(Some(self.info(node)?))
         } else {
@@ -119,7 +154,8 @@ impl FilesFuse {
     }
 
     fn read_node(&self, node: u64, offset: u64, length: u64) -> Result<Bytes> {
-        let path = format!("files/{node}");
+        let in_node = self.node_in(node);
+        let path = format!("files/{in_node}");
         let mut url = self.url.join(&path)?;
         let offset_option = format!("offset={offset}");
         let length_option = format!("length={length}");
@@ -130,7 +166,8 @@ impl FilesFuse {
     }
 
     fn write_node(&self, node: u64, offset: u64, data: &[u8]) -> Result<u64> {
-        let path = format!("files/{node}");
+        let in_node = self.node_in(node);
+        let path = format!("files/{in_node}");
         let mut url = self.url.join(&path)?;
         let offset_option = format!("offset={offset}");
         url.set_query(Some(&offset_option));
@@ -143,7 +180,8 @@ impl FilesFuse {
     }
 
     fn read_directory(&self, node: u64, offset: u64) -> Result<Vec<FileDirectoryEntry>> {
-        let path = format!("files/directory/{node}");
+        let in_node = self.node_in(node);
+        let path = format!("files/directory/{in_node}");
         let mut url = self.url.join(&path)?;
         if offset > 0 {
             let offset_option = format!("offset={offset}");
@@ -157,6 +195,22 @@ impl FilesFuse {
         let url = self.url.join("/files/sync")?;
         Client::new().put(url).send()?;
         Ok(())
+    }
+
+    fn node_out(&self, node: u64) -> u64 {
+        if node == self.root {
+            1
+        } else {
+            node
+        }
+    }
+
+    fn node_in(&self, node: u64) -> u64 {
+        if node == 1 {
+            self.root
+        } else {
+            node
+        }
     }
 }
 

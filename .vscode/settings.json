@@ -28,6 +28,7 @@
         "releasedir",
         "removexattr",
         "reqwest",
+        "serde",
         "setattr",
         "setlk",
         "setxattr",

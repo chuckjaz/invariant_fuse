@@ -20,6 +20,9 @@ pub struct FuseCommand {
 
     /// The location to mount the directory
     path: OsString,
+
+    /// The address or content link
+    content_link: String,
 }
 
 fn main() -> Result<()> {
@@ -28,23 +31,17 @@ fn main() -> Result<()> {
     let config = FuseCommand::parse();
     let url = config.url;
     let path_text = config.path;
-    println!("Starting FUSE: host: {url}, path: {path_text:?}");
+    let content_link = config.content_link;
+    println!("Starting FUSE: host: {url}, path: {path_text:?}, content: {content_link}");
     let path = Path::new(&path_text);
-    start_fuse(url, path)?;
+    start_fuse(url, path, &content_link)?;
+
     Ok(())
 }
 
-fn start_fuse(url: Url, path: &Path) -> Result<()>{
-    let filesystem = FilesFuse::new(url.clone());
-    let id = filesystem.ping();
-    match id {
-        Err(e) => {
-            println!("Could not connect to server at {url}, {e}");
-            Err(e)
-        },
-        Ok(_) =>  {
-            fuser::mount2(filesystem, path, &[])?;
-            Ok(())
-        }
-    }
+fn start_fuse(url: Url, path: &Path, content_link: &String) -> Result<()>{
+    let filesystem = FilesFuse::mount(url.clone(), content_link.clone())?;
+    fuser::mount2(filesystem, path, &[])?;
+
+    Ok(())
 }
