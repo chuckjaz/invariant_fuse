@@ -640,11 +640,19 @@ impl Filesystem for FilesFuse {
         reply: fuser::ReplyCreate,
     ) {
         debug!(
-            "[Not Implemented] create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
+            "create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
             flags: {:#x?})",
             parent, name, mode, umask, flags
         );
-        reply.error(ENOSYS);
+
+        let name_str = name.to_string_lossy();
+        match self.make_node_info(parent, &name_str, ContentKind::File) {
+            Ok(info) => {
+                let attr = info.to_attr(_req);
+                reply.created(&SLOT_TTL, &attr, 1, 0, flags as u32)
+            },
+            Err(_) => reply.error(ENOSYS),
+        }
     }
 
     fn getlk(
