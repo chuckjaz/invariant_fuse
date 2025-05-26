@@ -11,7 +11,7 @@ mod result;
 #[derive(Debug, Parser)]
 #[command(name = "inv-fuse")]
 #[command(author = "Chuck Jazdzewski (chuckjaz@gmail.com)")]
-#[command(version = "0.1.0")]
+#[command(version = "0.2.0")]
 #[command(about = "A FUSE to mount an invariant file system locally")]
 pub struct FuseCommand {
     /// The URL of the file system host. It is highly recommended that this be a local service
@@ -22,7 +22,12 @@ pub struct FuseCommand {
     path: OsString,
 
     /// The address or content link
-    content_link: String,
+    #[arg(long, value_parser = clap::value_parser!(String))]
+    content_link: Option<String>,
+
+    /// The inode number to use for the root directory
+    #[arg(long, value_parser = clap::value_parser!(u64))]
+    root: Option<u64>,
 }
 
 fn main() -> Result<()> {
@@ -32,15 +37,28 @@ fn main() -> Result<()> {
     let url = config.url;
     let path_text = config.path;
     let content_link = config.content_link;
-    println!("Starting FUSE: host: {url}, path: {path_text:?}, content: {content_link}");
+    let root = config.root;
+
+    if root.is_some() && content_link.is_some() {
+        Err("Cannot specify both root inode and content link")?;
+    }
+    if root.is_none() && content_link.is_none() {
+        Err("Must specify either root inode or content link")?;
+    }
+    println!("Starting FUSE: host: {url}, path: {path_text:?}");
     let path = Path::new(&path_text);
-    start_fuse(url, path, &content_link)?;
+    start_fuse(url, path, &content_link, &root)?;
 
     Ok(())
 }
 
-fn start_fuse(url: Url, path: &Path, content_link: &String) -> Result<()>{
-    let filesystem = FilesFuse::mount(url.clone(), content_link.clone())?;
+fn start_fuse(url: Url, path: &Path, content_link: &Option<String>, root: &Option<u64>) -> Result<()>{
+    let root = root.unwrap_or(1);
+    let filesystem = if let Some(link) = content_link {
+        FilesFuse::mount(url.clone(), link.clone())?
+    } else {
+        FilesFuse::create(url.clone(), root)
+    };
     fuser::mount2(filesystem, path, &[])?;
 
     Ok(())

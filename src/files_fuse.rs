@@ -18,6 +18,10 @@ pub struct FilesFuse {
 }
 
 impl FilesFuse {
+    pub fn create(url: Url, root: u64) -> FilesFuse {
+        Self { url, root }
+    }
+
     pub fn mount(url: Url, content_link: String) -> Result<FilesFuse> {
         let path = format!("files/mount");
         let mount_url = url.clone().join(&path)?;
