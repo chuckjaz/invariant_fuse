@@ -11,7 +11,7 @@ mod result;
 #[derive(Debug, Parser)]
 #[command(name = "inv-fuse")]
 #[command(author = "Chuck Jazdzewski (chuckjaz@gmail.com)")]
-#[command(version = "0.2.0")]
+#[command(version = "0.2.1")]
 #[command(about = "A FUSE to mount an invariant file system locally")]
 pub struct FuseCommand {
     /// The URL of the file system host. It is highly recommended that this be a local service

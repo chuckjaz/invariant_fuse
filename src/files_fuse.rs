@@ -113,7 +113,7 @@ impl FilesFuse {
 
     fn remove_node(&self, parent: u64, name: &str) -> Result<bool> {
         let in_parent = self.node_in(parent);
-        let path = format!("files/{in_parent}/{name}");
+        let path = format!("files/remove/{in_parent}/{name}");
         let url = self.url.join(&path)?;
         let text = Client::new().post(url).send()?.text()?;
 
@@ -847,16 +847,19 @@ impl ContentInformation {
 
 #[derive(Serialize, Deserialize)]
 struct EntryAttributes {
+    #[serde(skip_serializing_if = "Option::is_none")]
     executable: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     writable: Option<bool>,
 
-    #[serde(rename = "modifyTime")]
+    #[serde(rename = "modifyTime", skip_serializing_if = "Option::is_none")]
     modify_time: Option<u64>,
 
-    #[serde(rename = "createTime")]
+    #[serde(rename = "createTime", skip_serializing_if = "Option::is_none")]
     create_time: Option<u64>,
 
-    #[serde(rename = "type")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
 }
 
@@ -866,8 +869,9 @@ impl EntryAttributes {
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<std::time::SystemTime>,
     ) -> Result<Self> {
-        let executable = mode.and_then(|mode| Some(mode & X_BIT != 0));
-        let writable = mode.and_then(|mode| Some(mode & W_BIT != 0));
+        let executable = mode.and_then(|mode| Some((mode & X_BIT) != 0));
+        let writable = mode.and_then(|mode| Some((mode & W_BIT) != 0));
+        debug!("EntryAttributes: executable={:?} writable={:?}", executable, writable);
         let modify_time_duration = invert(mtime.and_then(|mtime| match mtime {
             fuser::TimeOrNow::SpecificTime(system_time) => Some(system_time),
             fuser::TimeOrNow::Now => Some(SystemTime::now()),
@@ -899,7 +903,7 @@ fn invert<T, E>(x: Option<std::result::Result<T, E>>) -> std::result::Result<Opt
     x.map_or(Ok(None), |v | v.map(Some))
 }
 
-const X_BIT: u32 = 0x100;
-const W_BIT: u32 = 0x200;
+const X_BIT: u32 = 0o100;
+const W_BIT: u32 = 0o200;
 
 const SLOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
