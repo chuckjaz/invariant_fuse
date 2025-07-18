@@ -33,6 +33,7 @@
         "setlk",
         "setxattr",
         "statfs",
+        "threadpool",
         "Xattr"
     ]
 }

@@ -4,34 +4,22 @@ use reqwest::{blocking::{Body, Client}, Url};
 use libc::{c_int, ENOENT, ENOSYS, EPERM};
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{time::{Duration, SystemTime, UNIX_EPOCH}};
 use crate::result::Result;
+use threadpool::ThreadPool;
 
-/// A file system implementation that uses the Files Server API
-pub struct FilesFuse {
+#[derive(Clone)]
+struct FilesServer {
     /// The url of the files server
     url: Url,
 
     /// The node mounted as root. This must be 1 for Filesystem APIs so it must be mapped to 1 for
     /// Filesystem APIs
-    root: u64
+    root: u64,
 }
 
-impl FilesFuse {
-    pub fn create(url: Url, root: u64) -> FilesFuse {
-        Self { url, root }
-    }
 
-    pub fn mount(url: Url, content_link: String) -> Result<FilesFuse> {
-        let path = format!("files/mount");
-        let mount_url = url.clone().join(&path)?;
-        let body = Body::from(content_link);
-        let text = Client::new().post(mount_url.clone()).body(body).send()?.text()?;
-        debug!("mount response: {text}");
-        let root = text.parse::<u64>()?;
-        Ok(Self { url, root })
-    }
-
+impl FilesServer {
     fn lookup(&self, parent: u64, name: &str) -> Result<u64> {
         let path = format!("files/lookup/{parent}/{name}");
         let url = self.url.join(&path)?;
@@ -218,6 +206,36 @@ impl FilesFuse {
     }
 }
 
+/// A file system implementation that uses the Files Server API
+pub struct FilesFuse {
+    /// The file server
+    server: FilesServer,
+
+    /// Thread pool to use
+    thread_pool: ThreadPool,
+}
+
+impl FilesFuse {
+    pub fn create(url: Url, root: u64) -> Self {
+        Self { server: FilesServer { url, root }, thread_pool: ThreadPool::new(8) }
+    }
+
+    pub fn mount(url: Url, content_link: String) -> Result<Self> {
+        let path = format!("files/mount");
+        let mount_url = url.clone().join(&path)?;
+        let body = Body::from(content_link);
+        let text = Client::new().post(mount_url.clone()).body(body).send()?.text()?;
+        debug!("mount response: {text}");
+        let root = text.parse::<u64>()?;
+        Ok(Self { server: FilesServer { url, root }, thread_pool: ThreadPool::new(8) })
+    }
+
+
+    fn run<F: FnOnce() + Send + 'static>(&mut self, f: F) {
+        self.thread_pool.execute(f);
+    }
+}
+
 impl Filesystem for FilesFuse {
     fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> std::result::Result<(), c_int> {
         Ok(())
@@ -227,30 +245,40 @@ impl Filesystem for FilesFuse {
 
     fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
         debug!("lookup(parent: {:#x?}, name {:?})", parent, name);
-        let name_str = name.to_string_lossy();
-        match self.lookup_info(parent, &name_str) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.entry(&SLOT_TTL, &attr, 1)
-            },
-            Err(_) => reply.error(ENOENT),
-        }
+        let server = self.server.clone();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        let name_str: String = name.to_string_lossy().into();
+        self.run(move || {
+            match server.lookup_info(parent, &name_str) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    reply.entry(&SLOT_TTL, &attr, 1)
+                },
+                Err(_) => reply.error(ENOENT),
+            }
+        });
     }
 
     fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: Option<u64>, reply: fuser::ReplyAttr) {
         debug!("getattr(ino: {:#x?}, fh: {:#x?})", ino, fh);
-        match self.info(ino) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.attr(&SLOT_TTL, &attr)
-            },
-            Err(err) => {
-                debug!("getattr({ino:#x?}: err: {err}");
-                reply.error(ENOENT)
-            },
-        }
+        let server = self.server.clone();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        self.run(move || {
+            match server.info(ino) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    reply.attr(&SLOT_TTL, &attr)
+                },
+                Err(err) => {
+                    debug!("getattr({ino:#x?}: err: {err}");
+                    reply.error(ENOENT)
+                },
+            }
+        })
     }
 
     fn setattr(
@@ -274,13 +302,18 @@ impl Filesystem for FilesFuse {
         debug!("setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
             ino, mode, uid, gid, size, fh, flags
         );
-        match self.setattr_info_spec(ino, mode, _mtime, _ctime) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.attr(&SLOT_TTL, &attr)
-            },
-            Err(_) => reply.error(ENOENT)
-        }
+        let server = self.server.clone();
+        let effective_uid = _req.uid();
+        let effective_gid = _req.gid();
+        self.run(move || {
+            match server.setattr_info_spec(ino, mode, _mtime, _ctime) {
+                Ok(info) => {
+                    let attr = info.to_attr(effective_uid, effective_gid);
+                    reply.attr(&SLOT_TTL, &attr)
+                },
+                Err(_) => reply.error(ENOENT)
+            }
+        })
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
@@ -301,14 +334,19 @@ impl Filesystem for FilesFuse {
         debug!("mknod(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, rdev: {})",
             parent, name, mode, umask, rdev
         );
-        let name_str = name.to_string_lossy();
-        match self.make_node_info(parent, &name_str, ContentKind::File) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.entry(&SLOT_TTL, &attr, 1)
-            },
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        let name_str: String = name.to_string_lossy().into();
+        self.run(move || {
+            match server.make_node_info(parent, &name_str, ContentKind::File) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    reply.entry(&SLOT_TTL, &attr, 1)
+                },
+                Err(_) => reply.error(ENOSYS),
+            }
+        });
     }
 
     fn mkdir(
@@ -323,32 +361,44 @@ impl Filesystem for FilesFuse {
         debug!("mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
             parent, name, mode, umask
         );
-        let name_str = name.to_string_lossy();
-        match self.make_node_info(parent, &name_str, ContentKind::Directory) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.entry(&SLOT_TTL, &attr, 1)
-            },
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let name_str: String = name.to_string_lossy().into();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        self.run(move || {
+            match server.make_node_info(parent, &name_str, ContentKind::Directory) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    reply.entry(&SLOT_TTL, &attr, 1)
+                },
+                Err(_) => reply.error(ENOSYS),
+            }
+
+        })
     }
 
     fn unlink(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
         debug!("unlink(parent: {:#x?}, name: {:?})", parent, name);
-        let name_str = name.to_string_lossy();
-        match self.remove_node(parent, &name_str) {
-            Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let name_str: String = name.to_string_lossy().into();
+        self.run(move || {
+            match server.remove_node(parent, &name_str) {
+                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn rmdir(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
         debug!("rmdir(parent: {:#x?}, name: {:?})", parent, name);
-        let name_str = name.to_string_lossy();
-        match self.remove_node(parent, &name_str) {
-            Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let name_str: String = name.to_string_lossy().into();
+        self.run(move || {
+            match server.remove_node(parent, &name_str) {
+                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn symlink(
@@ -379,12 +429,15 @@ impl Filesystem for FilesFuse {
         debug!("rename(parent: {:#x?}, name: {:?}, newparent: {:#x?},  newname: {:?}, flags: {})",
             parent, name, newparent, newname, flags,
         );
-        let name_str = name.to_string_lossy();
-        let new_name_str = newname.to_string_lossy();
-        match self.rename_node(parent, &name_str, newparent, &new_name_str) {
-            Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let name_str: String = name.to_string_lossy().into();
+        let new_name_str: String = newname.to_string_lossy().into();
+        self.run(move || {
+            match server.rename_node(parent, &name_str, newparent, &new_name_str) {
+                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn link(
@@ -398,17 +451,22 @@ impl Filesystem for FilesFuse {
         debug!("link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
             ino, newparent, newname
         );
-        let new_name_str = newname.to_string_lossy();
-        match self.link_info(newparent, ino, &new_name_str) {
-            Ok(result) => match result {
-                Some(info) => {
-                    let attr = info.to_attr(_req);
-                    reply.entry(&SLOT_TTL, &attr, 1);
-                }
-                None => reply.error(ENOENT),
-            },
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let new_name_str: String = newname.to_string_lossy().into();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        self.run(move || {
+            match server.link_info(newparent, ino, &new_name_str) {
+                Ok(result) => match result {
+                    Some(info) => {
+                        let attr = info.to_attr(uid, gid);
+                        reply.entry(&SLOT_TTL, &attr, 1);
+                    }
+                    None => reply.error(ENOENT),
+                },
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
@@ -429,12 +487,17 @@ impl Filesystem for FilesFuse {
         debug!("read(ino: {:#x?}, fh: {}, offset: {}, size: {}, flags: {:#x?}, lock_owner: {:?})",
             ino, fh, offset, size, flags, lock_owner
         );
-        match self.read_node(ino, offset.try_into().unwrap(), size.into()) {
-            Ok(bytes) => {
-                reply.data(&bytes[..]);
+        let server = self.server.clone();
+        let effective_offset: u64 = offset.try_into().unwrap();
+        let effective_size: u64 = size.into();
+        self.run(move || {
+            match server.read_node(ino, effective_offset, effective_size) {
+                Ok(bytes) => {
+                    reply.data(&bytes[..]);
+                }
+                Err(_) => reply.error(ENOSYS),
             }
-            Err(_) => reply.error(ENOSYS),
-        }
+        })
     }
 
     fn write(
@@ -458,18 +521,26 @@ impl Filesystem for FilesFuse {
             flags,
             lock_owner
         );
-        match self.write_node(ino, offset.try_into().unwrap(), data) {
-            Ok(written) => reply.written(written.try_into().unwrap()),
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let effective_offset: u64 = offset.try_into().unwrap();
+        let data_buf = Vec::from(data);
+        self.run(move || {
+            match server.write_node(ino, effective_offset, &data_buf) {
+                Ok(written) => reply.written(written.try_into().unwrap()),
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
         debug!("flush(ino: {:#x?}, fh: {}, lock_owner: {:?})", ino, fh, lock_owner );
-        match self.sync() {
-            Ok(_) => reply.ok(),
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        self.run(move || {
+            match server.sync() {
+                Ok(_) => reply.ok(),
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn release(
@@ -489,10 +560,13 @@ impl Filesystem for FilesFuse {
         debug!("fsync(ino: {:#x?}, fh: {}, datasync: {})",
             ino, fh, datasync
         );
-        match self.sync() {
-            Ok(_) => reply.ok(),
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        self.run(move || {
+            match server.sync() {
+                Ok(_) => reply.ok(),
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn opendir(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
@@ -510,29 +584,32 @@ impl Filesystem for FilesFuse {
         debug!("readdir(ino: {:#x?}, fh: {}, offset: {})",
             ino, fh, offset
         );
-        match self.read_directory(ino, offset.try_into().unwrap()) {
-            Ok(entries) => {
-                let mut off = offset;
-                debug!("readdir: entries.len {}", entries.len());
-                for entry in entries {
-                    let kind = if entry.kind == ContentKind::Directory {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    if reply.add(entry.node, off + 1, kind, &entry.name) {
-                        break;
+        let server = self.server.clone();
+        let effective_offset = offset.try_into().unwrap();
+        self.run(move || {
+            match server.read_directory(ino, effective_offset) {
+                Ok(entries) => {
+                    let mut off = offset;
+                    debug!("readdir: entries.len {}", entries.len());
+                    for entry in entries {
+                        let kind = if entry.kind == ContentKind::Directory {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        if reply.add(entry.node, off + 1, kind, &entry.name) {
+                            break;
+                        }
+                        off += 1;
                     }
-                    off += 1;
+                    reply.ok();
+                },
+                Err(err) => {
+                    debug!("readdir: err {err}");
+                    reply.error(ENOSYS)
                 }
-                reply.ok();
-            },
-            Err(err) => {
-                debug!("readdir: err {err}");
-                reply.error(ENOSYS)
             }
-        }
-
+        })
     }
 
     fn readdirplus(
@@ -648,15 +725,19 @@ impl Filesystem for FilesFuse {
             flags: {:#x?})",
             parent, name, mode, umask, flags
         );
-
-        let name_str = name.to_string_lossy();
-        match self.make_node_info(parent, &name_str, ContentKind::File) {
-            Ok(info) => {
-                let attr = info.to_attr(_req);
-                reply.created(&SLOT_TTL, &attr, 1, 0, flags as u32)
-            },
-            Err(_) => reply.error(ENOSYS),
-        }
+        let server = self.server.clone();
+        let name_str: String = name.to_string_lossy().into();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        self.run(move || {
+            match server.make_node_info(parent, &name_str, ContentKind::File) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    reply.created(&SLOT_TTL, &attr, 1, 0, flags as u32)
+                },
+                Err(_) => reply.error(ENOSYS),
+            }
+        })
     }
 
     fn getlk(
@@ -815,9 +896,7 @@ struct ContentInformation {
 }
 
 impl ContentInformation {
-    fn to_attr(&self, req: &fuser::Request<'_>) -> FileAttr {
-        let uid = req.uid();
-        let gid = req.gid();
+    fn to_attr(&self, uid: u32, gid: u32) -> FileAttr {
         let mtime = UNIX_EPOCH + Duration::from_millis(self.modify_time);
         let ctime = UNIX_EPOCH + Duration::from_millis(self.create_time);
         let kind = if self.kind == ContentKind::File { FileType::RegularFile } else { FileType::Directory };
