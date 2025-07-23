@@ -4,7 +4,7 @@ use reqwest::{blocking::{Body, Client}, Url};
 use libc::{c_int, ENOENT, ENOSYS, EPERM};
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::{time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::{BufRead, BufReader}, sync::{atomic::AtomicUsize, Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use crate::result::Result;
 use threadpool::ThreadPool;
 
@@ -20,32 +20,17 @@ struct FilesServer {
 
 
 impl FilesServer {
-    fn lookup(&self, parent: u64, name: &str) -> Result<u64> {
-        let path = format!("files/lookup/{parent}/{name}");
-        let url = self.url.join(&path)?;
-        let text = Client::new().get(url).send()?.text()?;
-        let node = text.parse::<u64>()?;
-
-        Ok(self.node_out(node))
-    }
-
     fn info(&self, node: u64) -> Result<ContentInformation> {
+        debug!("FileServer::info: node: {node}");
         let in_node = self.node_in(node);
         let path = format!("files/info/{in_node}");
         let url = self.url.join(&path)?;
         debug!("FileFuse::info url={url}");
-        let text = Client::new().get(url).send()?.text()?;
+        let client = Client::new();
+        let text = client.get(url).send()?.text()?;
         let content_info = serde_json::from_str::<ContentInformation>(&text)?;
-
+        debug!("FileServer::info: return");
         Ok(content_info)
-    }
-
-    fn lookup_info(&self, parent: u64, name: &str) -> Result<ContentInformation> {
-        let in_parent = self.node_in(parent);
-        let node = self.lookup(in_parent, name)?;
-        let info = self.info(node)?;
-
-        Ok(info)
     }
 
     fn setattr(&self, node: u64, attr: &EntryAttributes) -> Result<()> {
@@ -53,14 +38,15 @@ impl FilesServer {
         let path = format!("files/attributes/{in_node}");
         let url = self.url.join(&path)?;
         let attr_text = serde_json::to_string(attr)?;
-        Client::new().put(url).body(attr_text).send()?;
+        let client = Client::new();
+        client.put(url).body(attr_text).send()?;
 
         Ok(())
     }
 
     fn setattr_info(&self, node: u64, attr: &EntryAttributes) -> Result<ContentInformation> {
         let in_node = self.node_in(node);
-        self.setattr(in_node, attr)?;
+         self.setattr(in_node, attr)?;
 
         self.info(node)
     }
@@ -78,16 +64,19 @@ impl FilesServer {
     }
 
     fn make_node(&self, parent: u64, name: &str, kind: ContentKind) -> Result<u64> {
+        debug!("FileServer:make_node: parent:{parent} name:{name}, kind: {kind:#?}");
         let in_parent = self.node_in(parent);
         let path = format!("files/{in_parent}/{name}");
         let mut url = self.url.join(&path)?;
         if kind == ContentKind::Directory {
             url.set_query(Some("kind=Directory"))
         }
-        let node_text = Client::new().put(url).send()?.text()?;
+        let client = Client::new();
+        let node_text = client.put(url).send()?.text()?;
         let node = node_text.parse::<u64>()?;
         let node_out = self.node_out(node);
 
+        debug!("FileServer:make_node:return parent:{parent} name:{name}, kind: {kind:#?} -> {node_out}");
         Ok(node_out)
     }
 
@@ -103,7 +92,8 @@ impl FilesServer {
         let in_parent = self.node_in(parent);
         let path = format!("files/remove/{in_parent}/{name}");
         let url = self.url.join(&path)?;
-        let text = Client::new().post(url).send()?.text()?;
+        let client = Client::new();
+        let text = client.post(url).send()?.text()?;
 
         Ok(text.parse()?)
     }
@@ -117,7 +107,8 @@ impl FilesServer {
         let new_name = format!("newName={new_name}");
         url.set_query(Some(&new_parent));
         url.set_query(Some(&new_name));
-        let response = Client::new().post(url).send()?;
+        let client = Client::new();
+        let response = client.post(url).send()?;
 
         Ok(response.status() == 200)
     }
@@ -129,7 +120,8 @@ impl FilesServer {
         let mut url = self.url.join(&path)?;
         let node = format!("node={in_node}");
         url.set_query(Some(&node));
-        let response = Client::new().post(url).send()?;
+        let client = Client::new();
+        let response = client.post(url).send()?;
 
         Ok(response.status() == 200)
     }
@@ -153,11 +145,13 @@ impl FilesServer {
         let length_option = format!("length={length}");
         url.set_query(Some(&offset_option));
         url.set_query(Some(&length_option));
-        let response = Client::new().get(url).send()?;
+        let client = Client::new();
+        let response = client.get(url).send()?;
         Ok(response.bytes()?)
     }
 
     fn write_node(&self, node: u64, offset: u64, data: &[u8]) -> Result<u64> {
+        debug!("FileServer::write_node: node: {node}, offset: {offset}");
         let in_node = self.node_in(node);
         let path = format!("files/{in_node}");
         let mut url = self.url.join(&path)?;
@@ -165,9 +159,11 @@ impl FilesServer {
         url.set_query(Some(&offset_option));
         let bytes = Bytes::copy_from_slice(data);
         let body = Body::from(bytes);
-        let response = Client::new().post(url).body(body).send()?;
+        let client = Client::new();
+        let response = client.post(url).body(body).send()?;
         let text = response.text()?;
         let written: u64 = text.parse()?;
+        debug!("FileServer::write_node return: node: {node} -> {written}");
         Ok(written)
     }
 
@@ -179,13 +175,44 @@ impl FilesServer {
             let offset_option = format!("offset={offset}");
             url.set_query(Some(&offset_option));
         }
-        let text = Client::new().get(url).send()?.text()?;
+        let client = Client::new();
+        let text = client.get(url).send()?.text()?;
         Ok(serde_json::from_str(&text)?)
+    }
+
+    fn watch<C, F>(&self, changed: C, forgotten: F) -> Result<()>
+        where C: Fn(&ContentInformation) -> (), F: Fn(u64) -> ()
+    {
+        debug!("server:watch");
+        let path = "files/watch";
+        let url = self.url.join(&path)?;
+        let response = Client::new().get(url).send()?;
+        let reader = BufReader::new(response);
+        for line_result in reader.lines() {
+            let line = line_result?;
+            debug!("watch line: {line}");
+            let item: WatchItem = serde_json::from_str(&line)?;
+            if item.kind == "changed" && !item.info.is_none() {
+                let mut info = item.info.unwrap();
+                if info.node == self.root {
+                    info.node = 1;
+                }
+                changed(&info);
+            } else if item.kind == "forgotten" && !item.node.is_none() {
+                let mut node = item.node.unwrap();
+                if node == self.root {
+                    node = 1;
+                }
+                forgotten(node);
+            }
+        }
+        Ok(())
     }
 
     fn sync(&self) -> Result<()> {
         let url = self.url.join("/files/sync")?;
-        Client::new().put(url).send()?;
+        let client = Client::new();
+        client.put(url).send()?;
         Ok(())
     }
 
@@ -206,6 +233,136 @@ impl FilesServer {
     }
 }
 
+struct DirectoryEntryCache {
+    map: HashMap<String, u64>,
+    order: Vec<String>,
+}
+
+impl DirectoryEntryCache {
+    fn new() -> Arc<Mutex<DirectoryEntryCache>> {
+        Arc::new(Mutex::new(Self { map: HashMap::new(), order: Vec::new() }))
+    }
+
+    fn get(&self, name: &String) -> Option<&u64> {
+        self.map.get(name)
+    }
+
+    fn insert(&mut self, name: &String, node: u64) {
+        let previous = self.map.insert(name.clone(), node);
+        if previous.is_none() {
+            self.order.push(name.clone());
+        }
+    }
+
+    fn each<F>(&self, mut f: F) where F: FnMut(i64, &String, u64) -> bool {
+        let mut index = 0;
+        for name in self.order.iter() {
+            let node = self.map.get(name).unwrap();
+            if !f(index, name, *node) { break; }
+            index += 1;
+        }
+    }
+}
+
+struct InfoCache {
+    info_map: Mutex<HashMap<u64, ContentInformation>>,
+    directory_entries: Arc<Mutex<HashMap<u64, Arc<Mutex<DirectoryEntryCache>>>>>
+}
+
+impl InfoCache {
+    fn new() -> Arc<InfoCache> {
+        Arc::new(InfoCache {
+            info_map: Mutex::new(HashMap::new()),
+            directory_entries: Arc::new(Mutex::new(HashMap::new()))
+        })
+    }
+
+   fn ensure_directory(
+        &self,
+        parent: u64,
+        server: &FilesServer,
+    ) -> Option<Arc<Mutex<DirectoryEntryCache>>>  {
+        debug!("InfoCache:ensure_directory: {parent}");
+        let mut directory_entries = self.directory_entries.lock().unwrap();
+        let mut info_map = self.info_map.lock().unwrap();
+        if let Some(entries) = directory_entries.get(&parent) {
+            debug!("InfoCache:ensure_directory: {parent} found");
+            Some((*entries).clone())
+        } else {
+            debug!("InfoCache:ensure_directory: {parent} not found, reading from server");
+            let new_entries = DirectoryEntryCache::new();
+            match server.read_directory(parent, 0) {
+                Ok(entries) => {
+                    let mut new_entries_locked = new_entries.lock().unwrap();
+                    for entry in entries {
+                        info_map.insert(entry.info.node, entry.info.clone());
+                        new_entries_locked.insert(&entry.name, entry.info.node);
+                    }
+                    directory_entries.insert(parent, new_entries.clone());
+                    debug!("InfoCache:ensure_directory: {parent} read complete");
+                    Some(new_entries.clone())
+                }
+                Err(_) => {
+                    debug!("InfoCache:ensure_directory: {parent} READ FAILED");
+                    None
+                }
+            }
+        }
+    }
+
+    fn find_info(
+        &self,
+        node: u64,
+        server: &FilesServer
+    ) -> Option<ContentInformation> {
+        debug!("InfoCache:find_node: {node}");
+        let mut info_map = self.info_map.lock().unwrap();
+        match info_map.get(&node) {
+            Some(info) => Some(info.clone()),
+            None => {
+                match server.info(node) {
+                    Ok(info) => {
+                        info_map.insert(node, info.clone());
+                        Some(info)
+                    }
+                    Err(_) => None
+                }
+            }
+        }
+    }
+
+    fn invalidate_node(
+        &self,
+        node: u64
+    ) {
+        debug!("InfoCache:invalidate_node: {node}");
+        let mut directory_entries = self.directory_entries.lock().unwrap();
+        let mut info_map = self.info_map.lock().unwrap();
+        info_map.remove(&node);
+        directory_entries.remove(&node);
+
+    }
+    fn watch(
+        &self,
+        server: &FilesServer
+    ) -> Result<()> {
+        debug!("InfoCache:watch");
+        server.watch(|info| {
+            let mut info_map = self.info_map.lock().unwrap();
+            if info_map.contains_key(&info.node) {
+            let previous = info_map.insert(info.node, info.clone()).unwrap();
+                if info.kind == ContentKind::Directory && info.etag != previous.etag {
+                    let mut directory_entries = self.directory_entries.lock().unwrap();
+                    directory_entries.remove(&info.node);
+                }
+            }
+        }, | node | {
+            self.invalidate_node(node);
+        })?;
+        Ok(())
+    }
+}
+
 /// A file system implementation that uses the Files Server API
 pub struct FilesFuse {
     /// The file server
@@ -213,49 +370,91 @@ pub struct FilesFuse {
 
     /// Thread pool to use
     thread_pool: ThreadPool,
+
+    /// Directory info cache
+    info_cache: Arc<InfoCache>,
 }
+
+static RUN_ID: AtomicUsize = AtomicUsize::new(0);
 
 impl FilesFuse {
     pub fn create(url: Url, root: u64) -> Self {
-        Self { server: FilesServer { url, root }, thread_pool: ThreadPool::new(8) }
+        Self {
+            server: FilesServer { url, root },
+            thread_pool: ThreadPool::new(8),
+            info_cache: InfoCache::new(),
+        }
     }
 
     pub fn mount(url: Url, content_link: String) -> Result<Self> {
         let path = format!("files/mount");
         let mount_url = url.clone().join(&path)?;
         let body = Body::from(content_link);
-        let text = Client::new().post(mount_url.clone()).body(body).send()?.text()?;
+        let client = Client::new();
+        let text = client.post(mount_url.clone()).body(body).send()?.text()?;
         debug!("mount response: {text}");
         let root = text.parse::<u64>()?;
-        Ok(Self { server: FilesServer { url, root }, thread_pool: ThreadPool::new(8) })
+        Ok(Self {
+            server: FilesServer { url, root },
+            thread_pool: ThreadPool::new(8),
+            info_cache: InfoCache::new(),
+        })
     }
 
-
     fn run<F: FnOnce() + Send + 'static>(&mut self, f: F) {
-        self.thread_pool.execute(f);
+        self.thread_pool.execute(move || {
+            let id = RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let thread_id = std::thread::current().id();
+            debug!("FileFuse::run start: {id}, thread: {thread_id:?}");
+            f();
+            debug!("FileFuse::run done: {id}, thread: {thread_id:?}");
+        });
     }
 }
 
+
 impl Filesystem for FilesFuse {
     fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> std::result::Result<(), c_int> {
+                                                                                                                                                                                                    // let server = self.server.clone();
+        // let info_cache = self.info_cache.clone();
+        // self.run(move || {
+        //     match info_cache.watch(&server) {
+        //         Ok(()) => { }
+        //         Err(err) => {
+        //             debug!("init:watch: err {err}");
+        //         }
+        //     }
+        // });
         Ok(())
     }
 
     fn destroy(&mut self) {}
 
     fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
-        debug!("lookup(parent: {:#x?}, name {:?})", parent, name);
+        debug!("lookup(parent: {parent}, name {name:?})");
         let server = self.server.clone();
         let uid = _req.uid();
         let gid = _req.gid();
         let name_str: String = name.to_string_lossy().into();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.lookup_info(parent, &name_str) {
-                Ok(info) => {
-                    let attr = info.to_attr(uid, gid);
-                    reply.entry(&SLOT_TTL, &attr, 1)
-                },
-                Err(_) => reply.error(ENOENT),
+            match info_cache.ensure_directory(parent, &server) {
+                Some(directory) => {
+                    let dir = directory.lock().unwrap();
+                    match dir.get(&name_str) {
+                        Some(node) => {
+                            match info_cache.find_info(*node, &server) {
+                                Some(info) => {
+                                    let attr = info.to_attr(uid, gid);
+                                    reply.entry(&SLOT_TTL, &attr, 1)
+                                }
+                                None => reply.error(ENOENT)
+                            }
+                        },
+                        None => reply.error(ENOENT),
+                    }
+                }
+                None => reply.error(ENOENT)
             }
         });
     }
@@ -263,18 +462,18 @@ impl Filesystem for FilesFuse {
     fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: Option<u64>, reply: fuser::ReplyAttr) {
-        debug!("getattr(ino: {:#x?}, fh: {:#x?})", ino, fh);
+        debug!("getattr(ino: {ino}, fh: {fh:?}");
         let server = self.server.clone();
         let uid = _req.uid();
         let gid = _req.gid();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.info(ino) {
-                Ok(info) => {
+            match info_cache.find_info(ino, &server) {
+                Some(info) => {
                     let attr = info.to_attr(uid, gid);
                     reply.attr(&SLOT_TTL, &attr)
                 },
-                Err(err) => {
-                    debug!("getattr({ino:#x?}: err: {err}");
+                None => {
                     reply.error(ENOENT)
                 },
             }
@@ -299,16 +498,16 @@ impl Filesystem for FilesFuse {
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!("setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, fh, flags
-        );
+        debug!("setattr(ino: {ino}, mode: {mode:?}, uid: {uid:?}, gid: {gid:?}, size: {size:?}, fh: {fh:?}, flags: {flags:?})");
         let server = self.server.clone();
         let effective_uid = _req.uid();
         let effective_gid = _req.gid();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.setattr_info_spec(ino, mode, _mtime, _ctime) {
                 Ok(info) => {
                     let attr = info.to_attr(effective_uid, effective_gid);
+                    info_cache.invalidate_node(ino);
                     reply.attr(&SLOT_TTL, &attr)
                 },
                 Err(_) => reply.error(ENOENT)
@@ -331,17 +530,17 @@ impl Filesystem for FilesFuse {
         rdev: u32,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("mknod(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, rdev: {})",
-            parent, name, mode, umask, rdev
-        );
+        debug!("mknod(parent: {parent}, name: {name:?}, mode: {mode}, umask: {umask}, rdev: {rdev})");
         let server = self.server.clone();
         let uid = _req.uid();
         let gid = _req.gid();
         let name_str: String = name.to_string_lossy().into();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.make_node_info(parent, &name_str, ContentKind::File) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
+                    info_cache.invalidate_node(parent);
                     reply.entry(&SLOT_TTL, &attr, 1)
                 },
                 Err(_) => reply.error(ENOSYS),
@@ -358,17 +557,17 @@ impl Filesystem for FilesFuse {
         umask: u32,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
-            parent, name, mode, umask
-        );
+        debug!("mkdir(parent: {parent}, name: {name:?}, mode: {mode}, umask: {umask})");
         let server = self.server.clone();
         let name_str: String = name.to_string_lossy().into();
         let uid = _req.uid();
         let gid = _req.gid();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.make_node_info(parent, &name_str, ContentKind::Directory) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
+                    info_cache.invalidate_node(parent);
                     reply.entry(&SLOT_TTL, &attr, 1)
                 },
                 Err(_) => reply.error(ENOSYS),
@@ -378,24 +577,36 @@ impl Filesystem for FilesFuse {
     }
 
     fn unlink(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
-        debug!("unlink(parent: {:#x?}, name: {:?})", parent, name);
+        debug!("unlink(parent: {parent}, name: {name:?})");
         let server = self.server.clone();
         let name_str: String = name.to_string_lossy().into();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.remove_node(parent, &name_str) {
-                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Ok(result) => if result {
+                    info_cache.invalidate_node(parent);
+                    reply.ok()
+                } else {
+                    reply.error(ENOENT)
+                }
                 Err(_) => reply.error(ENOSYS),
             }
         })
     }
 
     fn rmdir(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
-        debug!("rmdir(parent: {:#x?}, name: {:?})", parent, name);
+        debug!("rmdir(parent: {parent}, name: {name:?})");
         let server = self.server.clone();
         let name_str: String = name.to_string_lossy().into();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.remove_node(parent, &name_str) {
-                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Ok(result) => if result {
+                    info_cache.invalidate_node(parent);
+                    reply.ok()
+                } else {
+                    reply.error(ENOENT)
+                }
                 Err(_) => reply.error(ENOSYS),
             }
         })
@@ -426,15 +637,21 @@ impl Filesystem for FilesFuse {
         flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("rename(parent: {:#x?}, name: {:?}, newparent: {:#x?},  newname: {:?}, flags: {})",
-            parent, name, newparent, newname, flags,
-        );
+        debug!("rename(parent: {parent}, name: {name:?}, newparent: {newparent},  newname: {newname:?}, flags: {flags})");
         let server = self.server.clone();
         let name_str: String = name.to_string_lossy().into();
         let new_name_str: String = newname.to_string_lossy().into();
+        let info_cache = self.info_cache.clone();
+
         self.run(move || {
             match server.rename_node(parent, &name_str, newparent, &new_name_str) {
-                Ok(result) => if result { reply.ok() } else { reply.error(ENOENT) }
+                Ok(result) => if result {
+                    info_cache.invalidate_node(parent);
+                    info_cache.invalidate_node(newparent);
+                    reply.ok()
+                } else {
+                    reply.error(ENOENT)
+                }
                 Err(_) => reply.error(ENOSYS),
             }
         })
@@ -448,18 +665,18 @@ impl Filesystem for FilesFuse {
         newname: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
-            ino, newparent, newname
-        );
+        debug!("link(ino: {ino}, newparent: {newparent}, newname: {newname:?})");
         let server = self.server.clone();
         let new_name_str: String = newname.to_string_lossy().into();
         let uid = _req.uid();
         let gid = _req.gid();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.link_info(newparent, ino, &new_name_str) {
                 Ok(result) => match result {
                     Some(info) => {
                         let attr = info.to_attr(uid, gid);
+                        info_cache.invalidate_node(newparent);
                         reply.entry(&SLOT_TTL, &attr, 1);
                     }
                     None => reply.error(ENOENT),
@@ -484,9 +701,7 @@ impl Filesystem for FilesFuse {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        debug!("read(ino: {:#x?}, fh: {}, offset: {}, size: {}, flags: {:#x?}, lock_owner: {:?})",
-            ino, fh, offset, size, flags, lock_owner
-        );
+        debug!("read(ino: {ino}, fh: {fh}, offset: {offset}, size: {size}, flags: {flags}, lock_owner: {lock_owner:?})");
         let server = self.server.clone();
         let effective_offset: u64 = offset.try_into().unwrap();
         let effective_size: u64 = size.into();
@@ -512,28 +727,26 @@ impl Filesystem for FilesFuse {
         lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        debug!("write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
-            ino,
-            fh,
-            offset,
+        debug!("write(ino: {ino}, fh: {fh}, offset: {offset}, data.len(): {}, write_flags: {write_flags}, flags: {flags}, lock_owner: {lock_owner:?})",
             data.len(),
-            write_flags,
-            flags,
-            lock_owner
         );
         let server = self.server.clone();
         let effective_offset: u64 = offset.try_into().unwrap();
         let data_buf = Vec::from(data);
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.write_node(ino, effective_offset, &data_buf) {
-                Ok(written) => reply.written(written.try_into().unwrap()),
+                Ok(written) => {
+                    info_cache.invalidate_node(ino);
+                    reply.written(written.try_into().unwrap())
+                },
                 Err(_) => reply.error(ENOSYS),
             }
         })
     }
 
     fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
-        debug!("flush(ino: {:#x?}, fh: {}, lock_owner: {:?})", ino, fh, lock_owner );
+        debug!("flush(ino: {ino}, fh: {fh}, lock_owner: {lock_owner:?})");
         let server = self.server.clone();
         self.run(move || {
             match server.sync() {
@@ -557,9 +770,7 @@ impl Filesystem for FilesFuse {
     }
 
     fn fsync(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
-        debug!("fsync(ino: {:#x?}, fh: {}, datasync: {})",
-            ino, fh, datasync
-        );
+        debug!("fsync(ino: {ino}, fh: {fh}, datasync: {datasync})");
         let server = self.server.clone();
         self.run(move || {
             match server.sync() {
@@ -581,32 +792,33 @@ impl Filesystem for FilesFuse {
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        debug!("readdir(ino: {:#x?}, fh: {}, offset: {})",
-            ino, fh, offset
-        );
+        debug!("readdir(ino: {ino}, fh: {fh}, offset: {offset})");
         let server = self.server.clone();
         let effective_offset = offset.try_into().unwrap();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.read_directory(ino, effective_offset) {
-                Ok(entries) => {
-                    let mut off = offset;
-                    debug!("readdir: entries.len {}", entries.len());
-                    for entry in entries {
-                        let kind = if entry.kind == ContentKind::Directory {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        if reply.add(entry.node, off + 1, kind, &entry.name) {
-                            break;
-                        }
-                        off += 1;
-                    }
+            match info_cache.ensure_directory(ino, &server) {
+                Some(directory_entries) => {
+                    let entries = directory_entries.lock().unwrap();
+                    entries.each(|index, name, node| {
+                        if index >= effective_offset {
+                            match info_cache.find_info(node, &server) {
+                                Some(info) => {
+                                    let kind = if info.kind == ContentKind::Directory {
+                                        FileType::Directory
+                                    } else {
+                                        FileType::RegularFile
+                                    };
+                                    reply.add(info.node, index + 1, kind, name)
+                                }
+                                None => { false }
+                            }
+                        } else { true }
+                    });
                     reply.ok();
-                },
-                Err(err) => {
-                    debug!("readdir: err {err}");
-                    reply.error(ENOSYS)
+                }
+                None => {
+                    reply.error(ENOENT)
                 }
             }
         })
@@ -729,10 +941,12 @@ impl Filesystem for FilesFuse {
         let name_str: String = name.to_string_lossy().into();
         let uid = _req.uid();
         let gid = _req.gid();
+        let info_cache = self.info_cache.clone();
         self.run(move || {
             match server.make_node_info(parent, &name_str, ContentKind::File) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
+                    info_cache.invalidate_node(parent);
                     reply.created(&SLOT_TTL, &attr, 1, 0, flags as u32)
                 },
                 Err(_) => reply.error(ENOSYS),
@@ -876,7 +1090,7 @@ enum ContentKind {
     Directory,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct ContentInformation {
     node: u64,
     kind: ContentKind,
@@ -974,8 +1188,14 @@ impl EntryAttributes {
 #[derive(Serialize, Deserialize)]
 struct FileDirectoryEntry {
     name: String,
-    kind: ContentKind,
-    node: u64
+    info: ContentInformation,
+}
+
+#[derive(Clone, Deserialize)]
+struct WatchItem {
+    kind: String,
+    info: Option<ContentInformation>,
+    node: Option<u64>,
 }
 
 fn invert<T, E>(x: Option<std::result::Result<T, E>>) -> std::result::Result<Option<T>, E> {
