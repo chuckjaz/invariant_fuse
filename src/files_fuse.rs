@@ -1,10 +1,10 @@
 use bytes::Bytes;
 use fuser::{FileAttr, FileType, Filesystem};
 use reqwest::{blocking::{Body, Client}, Url};
-use libc::{c_int, ENOENT, ENOSYS, EPERM};
+use libc::{c_int, ENOENT, ENOSYS};
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::{BufRead, BufReader}, sync::{atomic::AtomicUsize, Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, sync::{atomic::AtomicUsize, Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use crate::result::Result;
 use threadpool::ThreadPool;
 
@@ -28,64 +28,68 @@ impl FilesServer {
         debug!("FileFuse::info url={url}");
         let client = Client::new();
         let text = client.get(url).send()?.text()?;
-        let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+        let mut content_info = serde_json::from_str::<ContentInformation>(&text)?;
         debug!("FileServer::info: return");
+        self.out_info(&mut content_info);
         Ok(content_info)
     }
 
-    fn setattr(&self, node: u64, attr: &EntryAttributes) -> Result<()> {
+    fn setattr(&self, node: u64, attr: &EntryAttributes) -> Result<ContentInformation> {
         let in_node = self.node_in(node);
         let path = format!("files/attributes/{in_node}");
         let url = self.url.join(&path)?;
         let attr_text = serde_json::to_string(attr)?;
         let client = Client::new();
-        client.put(url).body(attr_text).send()?;
-
-        Ok(())
+        let text = client.post(url).body(attr_text).send()?.text()?;
+        let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+        Ok(content_info)
     }
 
-    fn setattr_info(&self, node: u64, attr: &EntryAttributes) -> Result<ContentInformation> {
-        let in_node = self.node_in(node);
-         self.setattr(in_node, attr)?;
-
-        self.info(node)
-    }
-
-    fn setattr_info_spec(
+    fn setattr_spec(
         &self,
         node: u64,
         mode: Option<u32>,
         mtime: Option<fuser::TimeOrNow>,
-        ctime: Option<std::time::SystemTime>
+        ctime: Option<std::time::SystemTime>,
+        size: Option<u64>,
     ) -> Result<ContentInformation> {
         let in_node = self.node_in(node);
-        let attr = EntryAttributes::new(mode, mtime, ctime)?;
-        self.setattr_info(in_node, &attr)
+        let attr = EntryAttributes::new(mode, mtime, ctime, size)?;
+        self.setattr(in_node, &attr)
     }
 
-    fn make_node(&self, parent: u64, name: &str, kind: ContentKind) -> Result<u64> {
-        debug!("FileServer:make_node: parent:{parent} name:{name}, kind: {kind:#?}");
+    fn create_file(&self, parent: u64, name: &str) -> Result<ContentInformation> {
+        let in_parent = self.node_in(parent);
+        let path = format!("files/{in_parent}/{name}");
+        let url = self.url.join(&path)?;
+        let client = Client::new();
+        let text = client.put(url).send()?.text()?;
+        let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+        Ok(content_info)
+    }
+
+    fn create_directory(&self, parent: u64, name: &str) -> Result<ContentInformation> {
         let in_parent = self.node_in(parent);
         let path = format!("files/{in_parent}/{name}");
         let mut url = self.url.join(&path)?;
-        if kind == ContentKind::Directory {
-            url.set_query(Some("kind=Directory"))
-        }
+        url.set_query(Some("kind=Directory"));
         let client = Client::new();
-        let node_text = client.put(url).send()?.text()?;
-        let node = node_text.parse::<u64>()?;
-        let node_out = self.node_out(node);
-
-        debug!("FileServer:make_node:return parent:{parent} name:{name}, kind: {kind:#?} -> {node_out}");
-        Ok(node_out)
+        let text = client.put(url).send()?.text()?;
+        let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+        Ok(content_info)
     }
 
-    fn make_node_info(&self, parent: u64, name: &str, kind: ContentKind) -> Result<ContentInformation> {
+    fn create_symbolic_link(&self, parent: u64, name: &str, target: &str) -> Result<ContentInformation> {
         let in_parent = self.node_in(parent);
-        let node = self.make_node(in_parent, name, kind)?;
-        let node_out = self.node_out(node);
-
-        self.info(node_out)
+        let path = format!("files/{in_parent}/{name}");
+        let mut url = self.url.join(&path)?;
+        let target_param = format!("target={target}");
+        url.set_query(Some("kind=SymbolicLink"));
+        url.set_query(Some(&target_param));
+        let client = Client::new();
+        let text = client.put(url).send()?.text()?;
+        let content_info = serde_json::from_str::<ContentInformation>(&text)?;
+        Ok(content_info)
     }
 
     fn remove_node(&self, parent: u64, name: &str) -> Result<bool> {
@@ -122,7 +126,6 @@ impl FilesServer {
         url.set_query(Some(&node));
         let client = Client::new();
         let response = client.post(url).send()?;
-
         Ok(response.status() == 200)
     }
 
@@ -180,35 +183,6 @@ impl FilesServer {
         Ok(serde_json::from_str(&text)?)
     }
 
-    fn watch<C, F>(&self, changed: C, forgotten: F) -> Result<()>
-        where C: Fn(&ContentInformation) -> (), F: Fn(u64) -> ()
-    {
-        debug!("server:watch");
-        let path = "files/watch";
-        let url = self.url.join(&path)?;
-        let response = Client::new().get(url).send()?;
-        let reader = BufReader::new(response);
-        for line_result in reader.lines() {
-            let line = line_result?;
-            debug!("watch line: {line}");
-            let item: WatchItem = serde_json::from_str(&line)?;
-            if item.kind == "changed" && !item.info.is_none() {
-                let mut info = item.info.unwrap();
-                if info.node == self.root {
-                    info.node = 1;
-                }
-                changed(&info);
-            } else if item.kind == "forgotten" && !item.node.is_none() {
-                let mut node = item.node.unwrap();
-                if node == self.root {
-                    node = 1;
-                }
-                forgotten(node);
-            }
-        }
-        Ok(())
-    }
-
     fn sync(&self) -> Result<()> {
         let url = self.url.join("/files/sync")?;
         let client = Client::new();
@@ -216,11 +190,9 @@ impl FilesServer {
         Ok(())
     }
 
-    fn node_out(&self, node: u64) -> u64 {
-        if node == self.root {
-            1
-        } else {
-            node
+    fn out_info(&self, info: &mut ContentInformation) {
+        if info.node == self.root {
+            info.node = 1
         }
     }
 
@@ -297,6 +269,7 @@ impl InfoCache {
                     for entry in entries {
                         info_map.insert(entry.info.node, entry.info.clone());
                         new_entries_locked.insert(&entry.name, entry.info.node);
+                        debug!("InfoCache:ensure_directory: received: {parent} -> {} {}", entry.info.node, entry.name);
                     }
                     directory_entries.insert(parent, new_entries.clone());
                     debug!("InfoCache:ensure_directory: {parent} read complete");
@@ -307,6 +280,24 @@ impl InfoCache {
                     None
                 }
             }
+        }
+    }
+
+    fn add_info(
+        &self,
+        parent: u64,
+        name: &String,
+        info: &ContentInformation
+    ) {
+        let directory_entries = self.directory_entries.lock().unwrap();
+        let mut info_map = self.info_map.lock().unwrap();
+        info_map.insert(info.node, info.clone());
+        match directory_entries.get(&parent) {
+            Some(entries) => {
+                let mut e = entries.lock().unwrap();
+                e.insert(name, info.node);
+            }
+            None => {}
         }
     }
 
@@ -342,24 +333,15 @@ impl InfoCache {
         directory_entries.remove(&node);
 
     }
-    fn watch(
+
+    fn update_node(
         &self,
-        server: &FilesServer
-    ) -> Result<()> {
-        debug!("InfoCache:watch");
-        server.watch(|info| {
-            let mut info_map = self.info_map.lock().unwrap();
-            if info_map.contains_key(&info.node) {
-            let previous = info_map.insert(info.node, info.clone()).unwrap();
-                if info.kind == ContentKind::Directory && info.etag != previous.etag {
-                    let mut directory_entries = self.directory_entries.lock().unwrap();
-                    directory_entries.remove(&info.node);
-                }
-            }
-        }, | node | {
-            self.invalidate_node(node);
-        })?;
-        Ok(())
+        node: u64,
+        info: &ContentInformation
+    ) {
+        debug!("InfoCache:update_node: {node}");
+        let mut info_map = self.info_map.lock().unwrap();
+        info_map.insert(node, info.clone());
     }
 }
 
@@ -414,17 +396,7 @@ impl FilesFuse {
 
 
 impl Filesystem for FilesFuse {
-    fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> std::result::Result<(), c_int> {
-                                                                                                                                                                                                    // let server = self.server.clone();
-        // let info_cache = self.info_cache.clone();
-        // self.run(move || {
-        //     match info_cache.watch(&server) {
-        //         Ok(()) => { }
-        //         Err(err) => {
-        //             debug!("init:watch: err {err}");
-        //         }
-        //     }
-        // });
+    fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> std::result::Result<(), c_int> {                                                                                                                                                                                                    // let server = self.server.clone();
         Ok(())
     }
 
@@ -504,10 +476,10 @@ impl Filesystem for FilesFuse {
         let effective_gid = _req.gid();
         let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.setattr_info_spec(ino, mode, _mtime, _ctime) {
+            match server.setattr_spec(ino, mode, _mtime, _ctime, size) {
                 Ok(info) => {
                     let attr = info.to_attr(effective_uid, effective_gid);
-                    info_cache.invalidate_node(ino);
+                    info_cache.update_node(ino, &info);
                     reply.attr(&SLOT_TTL, &attr)
                 },
                 Err(_) => reply.error(ENOENT)
@@ -516,8 +488,18 @@ impl Filesystem for FilesFuse {
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
-        debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
-        reply.error(ENOSYS);
+        debug!("readlink(ino: {:#x?})", ino);
+        let server = self.server.clone();
+        let info_cache = self.info_cache.clone();
+        match info_cache.find_info(ino, &server) {
+            Some(info) => {
+                match info.target {
+                    Some(target) => reply.data(target.as_bytes()),
+                    None => reply.error(ENOENT),
+                }
+            }
+            None => reply.error(ENOENT)
+        }
     }
 
     fn mknod(
@@ -537,10 +519,10 @@ impl Filesystem for FilesFuse {
         let name_str: String = name.to_string_lossy().into();
         let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.make_node_info(parent, &name_str, ContentKind::File) {
+            match server.create_file(parent, &name_str) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
-                    info_cache.invalidate_node(parent);
+                    info_cache.add_info(parent, &name_str, &info);
                     reply.entry(&SLOT_TTL, &attr, 1)
                 },
                 Err(_) => reply.error(ENOSYS),
@@ -564,15 +546,14 @@ impl Filesystem for FilesFuse {
         let gid = _req.gid();
         let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.make_node_info(parent, &name_str, ContentKind::Directory) {
+            match server.create_directory(parent, &name_str) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
-                    info_cache.invalidate_node(parent);
+                    info_cache.add_info(parent, &name_str, &info);
                     reply.entry(&SLOT_TTL, &attr, 1)
                 },
                 Err(_) => reply.error(ENOSYS),
             }
-
         })
     }
 
@@ -620,11 +601,22 @@ impl Filesystem for FilesFuse {
         target: &std::path::Path,
         reply: fuser::ReplyEntry,
     ) {
-        debug!(
-            "[Not Implemented] symlink(parent: {:#x?}, link_name: {:?}, target: {:?})",
-            parent, link_name, target,
-        );
-        reply.error(EPERM);
+        let server = self.server.clone();
+        let name_str: String = link_name.to_string_lossy().into();
+        let target: String = target.to_str().unwrap().into();
+        let uid = _req.uid();
+        let gid = _req.gid();
+        let info_cache = self.info_cache.clone();
+        self.run(move || {
+            match server.create_symbolic_link(parent, &name_str, &target) {
+                Ok(info) => {
+                    let attr = info.to_attr(uid, gid);
+                    info_cache.add_info(parent, &name_str, &info);
+                    reply.entry(&SLOT_TTL, &attr, 1)
+                },
+                Err(_) => reply.error(ENOENT),
+            }
+        });
     }
 
     fn rename(
@@ -943,10 +935,10 @@ impl Filesystem for FilesFuse {
         let gid = _req.gid();
         let info_cache = self.info_cache.clone();
         self.run(move || {
-            match server.make_node_info(parent, &name_str, ContentKind::File) {
+            match server.create_file(parent, &name_str) {
                 Ok(info) => {
                     let attr = info.to_attr(uid, gid);
-                    info_cache.invalidate_node(parent);
+                    info_cache.add_info(parent, &name_str, &info);
                     reply.created(&SLOT_TTL, &attr, 1, 0, flags as u32)
                 },
                 Err(_) => reply.error(ENOSYS),
@@ -1088,6 +1080,7 @@ impl Filesystem for FilesFuse {
 enum ContentKind {
     File,
     Directory,
+    SymbolicLink,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1104,8 +1097,9 @@ struct ContentInformation {
     writable: bool,
     etag: String,
     size: Option<u64>,
+    target: Option<String>,
 
-    #[serde(rename = "contentType")]
+    #[serde(rename = "type")]
     content_type: Option<String>,
 }
 
@@ -1152,6 +1146,9 @@ struct EntryAttributes {
     #[serde(rename = "createTime", skip_serializing_if = "Option::is_none")]
     create_time: Option<u64>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
 }
@@ -1161,6 +1158,7 @@ impl EntryAttributes {
         mode: Option<u32>,
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<std::time::SystemTime>,
+        size: Option<u64>
     ) -> Result<Self> {
         let executable = mode.and_then(|mode| Some((mode & X_BIT) != 0));
         let writable = mode.and_then(|mode| Some((mode & W_BIT) != 0));
@@ -1179,6 +1177,7 @@ impl EntryAttributes {
                 writable,
                 modify_time,
                 create_time,
+                size,
                 content_type: None
             }
         )
@@ -1189,13 +1188,6 @@ impl EntryAttributes {
 struct FileDirectoryEntry {
     name: String,
     info: ContentInformation,
-}
-
-#[derive(Clone, Deserialize)]
-struct WatchItem {
-    kind: String,
-    info: Option<ContentInformation>,
-    node: Option<u64>,
 }
 
 fn invert<T, E>(x: Option<std::result::Result<T, E>>) -> std::result::Result<Option<T>, E> {
